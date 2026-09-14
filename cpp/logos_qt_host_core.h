@@ -76,13 +76,11 @@ inline QVariant toQVariant(const nlohmann::json& v)
 
 // A figure the producer did not report, as a QVariantMap value.
 //
-// A NULL QVariant, not 0.0. `logos_core_get_module_stats()` emits NULL for a
-// module nobody could account for, deliberately rather than 0 so that "never
-// measured" and "measured, idle" stay different answers, and ModuleStats
-// carries that through as `nullopt`. Handing a consumer 0.0 here would spend
-// the distinction at the last conversion before it is read: logos-basecamp's
-// Modules tab tests each figure for presence (ModuleStatsCells.cpp) and a 0.0
-// passes that test as a real reading.
+// A NULL QVariant, not 0.0. `ModuleStats` carries "nobody could measure this"
+// as `nullopt` to keep it apart from "measured, idle" (see logos_host_core.h),
+// and this is the last conversion before a consumer reads it: logos-basecamp's
+// Modules tab tests each figure for presence (ModuleStatsCells.cpp), so a 0.0
+// here would pass that test as a real reading and spend the distinction.
 //
 // The KEY is still inserted, so the map's shape does not depend on what was
 // measured and `contains()` keeps meaning "this SDK models that field".
@@ -100,7 +98,7 @@ inline QVariantMap toQVariantMap(const host::ModuleStats& s)
 {
     QVariantMap m;
     // The modelled fields, named as the struct names them.
-    m.insert(QStringLiteral("name"),        QString::fromStdString(s.name));
+    m.insert(QStringLiteral("name"),           QString::fromStdString(s.name));
     m.insert(QStringLiteral("cpuPercent"),     figureToQVariant(s.cpuPercent));
     m.insert(QStringLiteral("cpuTimeSeconds"), figureToQVariant(s.cpuTimeSeconds));
     // MEGABYTES. This was `memoryBytes` as a qlonglong, mirroring a struct

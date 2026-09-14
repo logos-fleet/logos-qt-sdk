@@ -188,7 +188,9 @@ TEST_F(QtHostCoreTest, AnUnreportedFigureIsANullVariantRatherThanZero)
     for (const char* key : {"cpuPercent", "cpuTimeSeconds", "memoryMb"}) {
         EXPECT_TRUE(m.contains(QLatin1String(key))) << key;
         EXPECT_TRUE(m.value(QLatin1String(key)).isNull()) << key;
-        EXPECT_FALSE(m.value(QLatin1String(key)).toDouble() != 0.0) << key;
+        // And isNull() is the only way to ask: a null QVariant still converts
+        // to 0.0, which is the very reading it has to stay distinct from.
+        EXPECT_DOUBLE_EQ(m.value(QLatin1String(key)).toDouble(), 0.0) << key;
     }
 
     // The rest of the entry still comes through, so a consumer can say WHY
