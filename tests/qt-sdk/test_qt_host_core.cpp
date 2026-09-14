@@ -160,4 +160,73 @@ TEST_F(QtHostCoreTest, MalformedStatsDoesNotThrowThroughTheQtLayer)
     EXPECT_TRUE(core.moduleStats(QStringLiteral("alpha")).isEmpty());
 }
 
+// ── the NULL figures liblogos is documented to emit ─────────────────────────
+//
+// The std layer models an unreported figure as `nullopt` (ModuleStats), because
+// `logos_core_get_module_stats()` emits NULL, never 0, for a module nobody
+// could account for. This is the conversion where that distinction is easiest
+// to lose: a `QVariant(double)` built off a defaulted optional would put 0.0
+// into the map, and a consumer reading the map — logos-basecamp's Modules tab
+// is one — cannot tell that apart from a module measured and found idle.
+
+TEST_F(QtHostCoreTest, AnUnreportedFigureIsANullVariantRatherThanZero)
+{
+    // The unmeasurable in-process entry, verbatim from
+    // logos-liblogos/src/logos_core/module_stats_json.cpp.
+    stub.statsJson =
+        R"([{"name":"alpha","pid":-1,"cpu_percent":null,)"
+        R"("cpu_time_seconds":null,"memory_mb":null,)"
+        R"("scope":"in_process","memory_kind":null}])";
+    QtLogosCore core(0, nullptr, LogosCore::Config{});
+
+    QVariantMap m;
+    ASSERT_NO_THROW(m = core.moduleStats(QStringLiteral("alpha")));
+    EXPECT_EQ(m.value("name").toString(), QStringLiteral("alpha"));
+
+    // Present as keys — the map's shape does not change with the reading — but
+    // NULL, which is what "no reading" looks like in a QVariantMap.
+    for (const char* key : {"cpuPercent", "cpuTimeSeconds", "memoryMb"}) {
+        EXPECT_TRUE(m.contains(QLatin1String(key))) << key;
+        EXPECT_TRUE(m.value(QLatin1String(key)).isNull()) << key;
+        EXPECT_FALSE(m.value(QLatin1String(key)).toDouble() != 0.0) << key;
+    }
+
+    // The rest of the entry still comes through, so a consumer can say WHY
+    // there is no figure rather than only that there is none.
+    EXPECT_EQ(m.value("scope").toString(), QStringLiteral("in_process"));
+    EXPECT_TRUE(m.value("memory_kind").isNull());
+    EXPECT_EQ(m.value("pid").toLongLong(), -1);
+}
+
+TEST_F(QtHostCoreTest, AMeasuredZeroIsStillAReading)
+{
+    // Zero is what a loaded, idle module reports, and it must stay a number:
+    // the one thing this conversion may not do is make the two cases agree.
+    stub.statsJson =
+        R"([{"name":"alpha","cpu_percent":0,"cpu_time_seconds":0.0,"memory_mb":0}])";
+    QtLogosCore core(0, nullptr, LogosCore::Config{});
+    const QVariantMap m = core.moduleStats(QStringLiteral("alpha"));
+
+    EXPECT_FALSE(m.value("cpuPercent").isNull());
+    EXPECT_DOUBLE_EQ(m.value("cpuPercent").toDouble(), 0.0);
+    EXPECT_FALSE(m.value("memoryMb").isNull());
+    EXPECT_DOUBLE_EQ(m.value("memoryMb").toDouble(), 0.0);
+}
+
+TEST_F(QtHostCoreTest, AllStatsSurvivesAnUnmeasurableEntry)
+{
+    // A host polls allStats() on a timer over EVERY loaded module; one
+    // unmeasurable module may not cost it the measured ones.
+    stub.statsJson =
+        R"([{"name":"alpha","cpu_percent":null,"cpu_time_seconds":null,"memory_mb":null},)"
+        R"({"name":"beta","cpu_percent":4.5,"cpu_time_seconds":1.0,"memory_mb":16.0}])";
+    QtLogosCore core(0, nullptr, LogosCore::Config{});
+
+    QVariantList all;
+    ASSERT_NO_THROW(all = core.allStats());
+    ASSERT_EQ(all.size(), 2);
+    EXPECT_TRUE(all[0].toMap().value("memoryMb").isNull());
+    EXPECT_DOUBLE_EQ(all[1].toMap().value("memoryMb").toDouble(), 16.0);
+}
+
 } // namespace

@@ -39,6 +39,7 @@
 #include <QVariant>
 #include <QVariantMap>
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,16 +74,33 @@ inline QVariant toQVariant(const nlohmann::json& v)
     return QVariant(QString::fromStdString(v.dump()));
 }
 
+// A figure the producer did not report, as a QVariantMap value.
+//
+// A NULL QVariant, not 0.0. `logos_core_get_module_stats()` emits NULL for a
+// module nobody could account for, deliberately rather than 0 so that "never
+// measured" and "measured, idle" stay different answers, and ModuleStats
+// carries that through as `nullopt`. Handing a consumer 0.0 here would spend
+// the distinction at the last conversion before it is read: logos-basecamp's
+// Modules tab tests each figure for presence (ModuleStatsCells.cpp) and a 0.0
+// passes that test as a real reading.
+//
+// The KEY is still inserted, so the map's shape does not depend on what was
+// measured and `contains()` keeps meaning "this SDK models that field".
+inline QVariant toQVariant(const std::optional<double>& figure)
+{
+    return figure.has_value() ? QVariant(*figure) : QVariant();
+}
+
 inline QVariantMap toQVariantMap(const host::ModuleStats& s)
 {
     QVariantMap m;
     // The modelled fields, named as the struct names them.
     m.insert(QStringLiteral("name"),        QString::fromStdString(s.name));
-    m.insert(QStringLiteral("cpuPercent"),     s.cpuPercent);
-    m.insert(QStringLiteral("cpuTimeSeconds"), s.cpuTimeSeconds);
+    m.insert(QStringLiteral("cpuPercent"),     toQVariant(s.cpuPercent));
+    m.insert(QStringLiteral("cpuTimeSeconds"), toQVariant(s.cpuTimeSeconds));
     // MEGABYTES. This was `memoryBytes` as a qlonglong, mirroring a struct
     // member that both misnamed the unit and read a JSON key nothing emits.
-    m.insert(QStringLiteral("memoryMb"),       s.memoryMb);
+    m.insert(QStringLiteral("memoryMb"),       toQVariant(s.memoryMb));
     // Plus every raw key, so a consumer sees fields added to liblogos' stats
     // JSON without waiting for this header to grow them. Modelled keys above
     // win on collision, since they are the documented spelling.
