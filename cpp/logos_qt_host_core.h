@@ -39,6 +39,7 @@
 #include <QVariant>
 #include <QVariantMap>
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,16 +74,36 @@ inline QVariant toQVariant(const nlohmann::json& v)
     return QVariant(QString::fromStdString(v.dump()));
 }
 
+// A figure the producer did not report, as a QVariantMap value.
+//
+// A NULL QVariant, not 0.0. `ModuleStats` carries "nobody could measure this"
+// as `nullopt` to keep it apart from "measured, idle" (see logos_host_core.h),
+// and this is the last conversion before a consumer reads it: logos-basecamp's
+// Modules tab tests each figure for presence (ModuleStatsCells.cpp), so a 0.0
+// here would pass that test as a real reading and spend the distinction.
+//
+// The KEY is still inserted, so the map's shape does not depend on what was
+// measured and `contains()` keeps meaning "this SDK models that field".
+//
+// NOT an overload of `toQVariant` above. `nlohmann::json` is implicitly
+// constructible from almost anything, `std::optional<double>` included, so
+// both candidates are viable for an optional argument and the call is
+// ambiguous — which is exactly how this failed to compile once.
+inline QVariant figureToQVariant(const std::optional<double>& figure)
+{
+    return figure.has_value() ? QVariant(*figure) : QVariant();
+}
+
 inline QVariantMap toQVariantMap(const host::ModuleStats& s)
 {
     QVariantMap m;
     // The modelled fields, named as the struct names them.
-    m.insert(QStringLiteral("name"),        QString::fromStdString(s.name));
-    m.insert(QStringLiteral("cpuPercent"),     s.cpuPercent);
-    m.insert(QStringLiteral("cpuTimeSeconds"), s.cpuTimeSeconds);
+    m.insert(QStringLiteral("name"),           QString::fromStdString(s.name));
+    m.insert(QStringLiteral("cpuPercent"),     figureToQVariant(s.cpuPercent));
+    m.insert(QStringLiteral("cpuTimeSeconds"), figureToQVariant(s.cpuTimeSeconds));
     // MEGABYTES. This was `memoryBytes` as a qlonglong, mirroring a struct
     // member that both misnamed the unit and read a JSON key nothing emits.
-    m.insert(QStringLiteral("memoryMb"),       s.memoryMb);
+    m.insert(QStringLiteral("memoryMb"),       figureToQVariant(s.memoryMb));
     // Plus every raw key, so a consumer sees fields added to liblogos' stats
     // JSON without waiting for this header to grow them. Modelled keys above
     // win on collision, since they are the documented spelling.
