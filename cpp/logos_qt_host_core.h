@@ -86,7 +86,12 @@ inline QVariant toQVariant(const nlohmann::json& v)
 //
 // The KEY is still inserted, so the map's shape does not depend on what was
 // measured and `contains()` keeps meaning "this SDK models that field".
-inline QVariant toQVariant(const std::optional<double>& figure)
+//
+// NOT an overload of `toQVariant` above. `nlohmann::json` is implicitly
+// constructible from almost anything, `std::optional<double>` included, so
+// both candidates are viable for an optional argument and the call is
+// ambiguous — which is exactly how this failed to compile once.
+inline QVariant figureToQVariant(const std::optional<double>& figure)
 {
     return figure.has_value() ? QVariant(*figure) : QVariant();
 }
@@ -96,11 +101,11 @@ inline QVariantMap toQVariantMap(const host::ModuleStats& s)
     QVariantMap m;
     // The modelled fields, named as the struct names them.
     m.insert(QStringLiteral("name"),        QString::fromStdString(s.name));
-    m.insert(QStringLiteral("cpuPercent"),     toQVariant(s.cpuPercent));
-    m.insert(QStringLiteral("cpuTimeSeconds"), toQVariant(s.cpuTimeSeconds));
+    m.insert(QStringLiteral("cpuPercent"),     figureToQVariant(s.cpuPercent));
+    m.insert(QStringLiteral("cpuTimeSeconds"), figureToQVariant(s.cpuTimeSeconds));
     // MEGABYTES. This was `memoryBytes` as a qlonglong, mirroring a struct
     // member that both misnamed the unit and read a JSON key nothing emits.
-    m.insert(QStringLiteral("memoryMb"),       toQVariant(s.memoryMb));
+    m.insert(QStringLiteral("memoryMb"),       figureToQVariant(s.memoryMb));
     // Plus every raw key, so a consumer sees fields added to liblogos' stats
     // JSON without waiting for this header to grow them. Modelled keys above
     // win on collision, since they are the documented spelling.
