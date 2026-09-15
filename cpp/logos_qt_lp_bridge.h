@@ -96,7 +96,7 @@ public:
     // Published because the lifetime is the contract, not an implementation
     // detail: a bridge is process-lifetime and a LogosAPI is not, so "which one,
     // and is it still there" is the question a caller (and a test) has to be
-    // able to ask. Returns a raw pointer rather than the weak handle -- nothing
+    // able to ask. Returns a raw pointer rather than the weak handle — nothing
     // outside may extend a lifetime this class deliberately does not own.
     LogosAPI* boundApi() const
     {
@@ -213,16 +213,24 @@ private:
                                             new LpBridge(api, sync, target, origin)))
                      .first;
         } else if (api) {
-            {
-                std::lock_guard<std::mutex> apiLock(it->second->m_apiMutex);
-                it->second->m_api = api;
-            }
-            // Publish the api BEFORE the hook that reads it: a concurrent
-            // syncTokens acquire-loads m_sync, so seeing a non-null hook implies
-            // seeing the api it was installed for.
-            if (sync) it->second->m_sync.store(sync, std::memory_order_release);
+            it->second->adopt(api, sync);
         }
         return it->second.get();
+    }
+
+    // Take `api` over from whatever this bridge was bound to before, and — the
+    // first time round, on a bridge forOrigin created — install the hook that
+    // reads it.
+    void adopt(LogosAPI* api, SyncFn sync)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_apiMutex);
+            m_api = api;
+        }
+        // Publish the api BEFORE the hook that reads it: a concurrent syncTokens
+        // acquire-loads m_sync, so seeing a non-null hook implies seeing the api
+        // it was installed for.
+        if (sync) m_sync.store(sync, std::memory_order_release);
     }
 
     LpBridge(LogosAPI* api, SyncFn sync, std::string target, std::string origin)
@@ -273,21 +281,21 @@ private:
         }
     }
 
-    // WEAK, and that is the fix for logos-workspace#158. This registry is
-    // process-lifetime and a bridge is never erased; a LogosAPI is neither. The
-    // mobile Shell builds one per MOUNT of a view module and deletes it when the
-    // app is closed, so a raw pointer here outlives its object as a matter of
-    // course — and the next call through the bridge read `api->getTokenManager()`
-    // out of freed memory and locked a QMutex at whatever those bytes said.
-    // Measured as a SIGSEGV inside QBasicMutex::lockInternal <-
-    // TokenManager::getToken <- syncFromApi, on chat_ui's 10-second health probe.
+    // WEAK, and that is the other half of logos-workspace#158. This registry
+    // is process-lifetime and a bridge is never erased; the per-mount LogosAPI
+    // `lookup` adopts is not — so a raw pointer here outlives its object as a
+    // matter of course, and the next call through the bridge read
+    // `api->getTokenManager()` out of freed memory and locked a QMutex at
+    // whatever those bytes said. Measured as a SIGSEGV inside
+    // QBasicMutex::lockInternal <- TokenManager::getToken <- syncFromApi, on
+    // chat_ui's 10-second health probe.
     //
     // A QObject handle rather than a QPointer<LogosAPI>, deliberately: this
     // member is emitted into EVERY translation unit that instantiates a bridge,
     // including the origin-bound ones whose whole premise is that they name no
     // Qt host identity type (nix/tests.nix greps the archive for exactly that).
-    // The one downcast back lives in boundApi(), which is emitted only where
-    // it is called -- syncFromApi and the tests -- and names no member of it.
+    // The one downcast back lives in boundApi(), which is emitted only where it
+    // is called — syncFromApi and the tests — and names no member of it.
     //
     // Guarded rather than atomic: a QPointer is one word plus Qt's refcount
     // block and cannot be swapped atomically, and `lookup` may adopt a newer api
