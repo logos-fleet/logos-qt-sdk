@@ -22,6 +22,8 @@
 // ---------------------------------------------------------------------------
 
 #include <QByteArray>
+#include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QVariant>
 
@@ -87,6 +89,20 @@ class LpBridge {
 
 public:
     logos::LpClient& client() { syncTokens(); return m_client; }
+
+    // The identity object this bridge mirrors the host's bootstrap tokens from,
+    // and NULL once that object is gone or when none was ever handed over.
+    //
+    // Published because the lifetime is the contract, not an implementation
+    // detail: a bridge is process-lifetime and a LogosAPI is not, so "which one,
+    // and is it still there" is the question a caller (and a test) has to be
+    // able to ask. Returns a raw pointer rather than the weak handle — nothing
+    // outside may extend a lifetime this class deliberately does not own.
+    LogosAPI* boundApi() const
+    {
+        std::lock_guard<std::mutex> lock(m_apiMutex);
+        return static_cast<LogosAPI*>(m_api.data());
+    }
 
     // The error-carrying async: `cb` fires exactly once with the result JSON
     // AND the call error.
@@ -169,13 +185,21 @@ private:
     // One bridge per (origin, target) for BOTH factories — the invariant this
     // class documents is about the pair, not about how the pair was spelled.
     //
-    // `api` is adopted rather than overwritten: null -> non-null only, never the
-    // reverse. Sharing the registry otherwise has one failure mode — an
-    // api-less bridge created first would leave a later Qt-plugin caller
-    // without `syncTokens`, i.e. an empty auth token and a call that fails
-    // silently, the exact defect syncTokens was added for. Adoption removes it.
-    // (Two LogosAPIs answering the same moduleName would be pathological; the
-    // first one wins.)
+    // `api` is adopted, and the LATEST one wins. Sharing the registry otherwise
+    // has one failure mode — an api-less bridge created first would leave a
+    // later Qt-plugin caller without `syncTokens`, i.e. an empty auth token and
+    // a call that fails silently, the exact defect syncTokens was added for.
+    // Adoption removes it.
+    //
+    // THE LATEST, not the first, and that is logos-workspace#158. An earlier
+    // revision kept the first api on the theory that "two LogosAPIs answering
+    // the same moduleName would be pathological". They are not: a view module
+    // gets ONE LogosAPI PER MOUNT (the mobile Shell's ViewModuleRunner
+    // constructs one in run() and deletes it in its destructor), so closing an
+    // app and opening it again produces a second, and the first is freed. The
+    // first-one-wins rule therefore pinned the bridge to the DEAD object, and
+    // the next call through it ran syncFromApi on freed memory. The one that
+    // arrived most recently is the one that is alive.
     static LpBridge* lookup(const std::string& origin, const std::string& target,
                             LogosAPI* api, SyncFn sync)
     {
@@ -188,14 +212,25 @@ private:
             it = s_bridges.emplace(key, std::unique_ptr<LpBridge>(
                                             new LpBridge(api, sync, target, origin)))
                      .first;
-        } else if (sync && !it->second->m_sync.load(std::memory_order_relaxed)) {
-            // Publish the api BEFORE the hook that reads it: a concurrent
-            // syncTokens acquire-loads m_sync, so seeing a non-null hook implies
-            // seeing the api it was installed for.
-            it->second->m_api.store(api, std::memory_order_relaxed);
-            it->second->m_sync.store(sync, std::memory_order_release);
+        } else if (api) {
+            it->second->adopt(api, sync);
         }
         return it->second.get();
+    }
+
+    // Take `api` over from whatever this bridge was bound to before, and — the
+    // first time round, on a bridge forOrigin created — install the hook that
+    // reads it.
+    void adopt(LogosAPI* api, SyncFn sync)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_apiMutex);
+            m_api = api;
+        }
+        // Publish the api BEFORE the hook that reads it: a concurrent syncTokens
+        // acquire-loads m_sync, so seeing a non-null hook implies seeing the api
+        // it was installed for.
+        if (sync) m_sync.store(sync, std::memory_order_release);
     }
 
     LpBridge(LogosAPI* api, SyncFn sync, std::string target, std::string origin)
@@ -235,7 +270,7 @@ private:
     // calls forOrigin links none of it.
     static void syncFromApi(LpBridge* self)
     {
-        LogosAPI* api = self->m_api.load(std::memory_order_relaxed);
+        LogosAPI* api = self->boundApi();
         if (!api) return;
         TokenManager* tm = api->getTokenManager();
         if (!tm) return;
@@ -246,10 +281,28 @@ private:
         }
     }
 
-    // Atomic only so `lookup` may adopt one into an already-published bridge
-    // without racing a concurrent `syncTokens`; the pointer itself never
-    // changes twice. Read ONLY by syncFromApi.
-    std::atomic<LogosAPI*> m_api{nullptr};
+    // WEAK, and that is the other half of logos-workspace#158. This registry
+    // is process-lifetime and a bridge is never erased; the per-mount LogosAPI
+    // `lookup` adopts is not — so a raw pointer here outlives its object as a
+    // matter of course, and the next call through the bridge read
+    // `api->getTokenManager()` out of freed memory and locked a QMutex at
+    // whatever those bytes said. Measured as a SIGSEGV inside
+    // QBasicMutex::lockInternal <- TokenManager::getToken <- syncFromApi, on
+    // chat_ui's 10-second health probe.
+    //
+    // A QObject handle rather than a QPointer<LogosAPI>, deliberately: this
+    // member is emitted into EVERY translation unit that instantiates a bridge,
+    // including the origin-bound ones whose whole premise is that they name no
+    // Qt host identity type (nix/tests.nix greps the archive for exactly that).
+    // The one downcast back lives in boundApi(), which is emitted only where it
+    // is called — syncFromApi and the tests — and names no member of it.
+    //
+    // Guarded rather than atomic: a QPointer is one word plus Qt's refcount
+    // block and cannot be swapped atomically, and `lookup` may adopt a newer api
+    // into an already-published bridge while another thread is in syncTokens.
+    // The clear on destruction is Qt's own and is atomic against this read.
+    QPointer<QObject> m_api;
+    mutable std::mutex m_apiMutex;  // guards m_api only
     // Null on the forOrigin path, and left null: an api-less bridge has nothing
     // to mirror (a cdylib's tokens arrive through the C ABI instead).
     std::atomic<SyncFn> m_sync{nullptr};

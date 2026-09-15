@@ -128,4 +128,51 @@ TEST_F(LpBridgeOriginTest, AnApiArrivingSecondIsStillAdopted)
     EXPECT_NO_THROW((void)viaApi->client());
 }
 
+// ── the identity object's LIFETIME (logos-workspace#158) ────────────────────
+//
+// The registry above is process-lifetime and a bridge is never erased. A
+// LogosAPI is not: the mobile Shell constructs one per MOUNT of a view module
+// (ViewModuleRunner) and deletes it when the app is unmounted, so the object a
+// bridge was handed can be gone long before the bridge is. These two tests are
+// the whole of what a bridge must do about that.
+
+// A bridge that outlived its LogosAPI mirrors tokens from NOTHING, rather than
+// from the address the object used to be at. The failure this replaces is a
+// SIGSEGV inside QBasicMutex::lockInternal <- TokenManager::getToken <-
+// LpBridge::syncFromApi, on chat_ui's periodic health probe: `getTokenManager()`
+// read out of freed memory and the call locked a QMutex at whatever those bytes
+// happened to say.
+TEST_F(LpBridgeOriginTest, ADestroyedApiIsForgotten)
+{
+    {
+        LogosAPI api(QStringLiteral("br_dead_api_module"));
+        ASSERT_NE(logos::qt::LpBridge::forTarget(&api, QStringLiteral("br_dead_target")),
+                  nullptr);
+    }
+
+    logos::qt::LpBridge* b = logos::qt::LpBridge::forOrigin(
+        QStringLiteral("br_dead_api_module"), QStringLiteral("br_dead_target"));
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(b->boundApi(), nullptr);
+    // And the hook runs without touching it.
+    EXPECT_NO_THROW((void)b->client());
+}
+
+// ...and a LATER api for the same pair is the one it mirrors from. This is the
+// remount: the first mount's object is dead and the second mount's is live, so
+// "the first one wins" is precisely the wrong rule. Two live objects here, so
+// the assertion is about the RULE rather than about freed memory.
+TEST_F(LpBridgeOriginTest, TheNewestApiForThePairIsTheOneBound)
+{
+    LogosAPI first(QStringLiteral("br_remount_module"));
+    logos::qt::LpBridge* b =
+        logos::qt::LpBridge::forTarget(&first, QStringLiteral("br_remount_target"));
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(b->boundApi(), &first);
+
+    LogosAPI second(QStringLiteral("br_remount_module"));
+    EXPECT_EQ(logos::qt::LpBridge::forTarget(&second, QStringLiteral("br_remount_target")), b);
+    EXPECT_EQ(b->boundApi(), &second);
+}
+
 }  // namespace
