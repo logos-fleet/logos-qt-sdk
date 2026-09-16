@@ -29,9 +29,9 @@ public:
     using RawEventCallback = std::function<void(const QString&, const QVariantList&)>;
     using EventCallback = std::function<void(const QVariantList&)>;
 
-    bool on(const QString& eventName, RawEventCallback callback);
-    bool on(const QString& eventName, EventCallback callback);
-    bool onMoved(std::function<void(const Point& from, const Point& to)> callback);
+    logos::SubHandle on(const QString& eventName, RawEventCallback callback);
+    logos::SubHandle on(const QString& eventName, EventCallback callback);
+    logos::SubHandle onMoved(std::function<void(const Point& from, const Point& to)> callback);
 
     // Watch this module's subscription transitions: Armed / Lost /
     // Held / Abandoned, with the establishment number. Lost followed by

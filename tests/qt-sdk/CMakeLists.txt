@@ -36,6 +36,10 @@ add_executable(qt_sdk_tests
     # wrapper's transport is keyed by, and that a STATED origin is never
     # collapsed into a derived one.
     test_qt_lp_bridge_origin.cpp
+    # The third question about that seam, and the one it had no answer to: who
+    # OWNS a subscription taken through it, and what ends one. A view backend is
+    # per-mount and its subscriptions were per-process.
+    test_qt_lp_subscription_ownership.cpp
 )
 
 target_include_directories(qt_sdk_tests PRIVATE

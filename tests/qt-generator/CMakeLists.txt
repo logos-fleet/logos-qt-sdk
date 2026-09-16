@@ -168,6 +168,43 @@ _qtgen_test(consumer_rejection_detector_stays_narrow
                          "if (!code->is_string() || !message->is_string() || !origin->is_string()) return false;"
                          "if (code == v.end() || message == v.end() || origin == v.end()) return false;")
 
+# --- 3d. a subscription NAMES ITS OWNER, and the accessor hands back a ticket -
+#
+# logos-workspace#220. The emitted `on...()` used to return a bare bool and
+# subscribe with no owner, which meant two things at once: the caller could
+# never name their subscription again, and the bridge parked it for the life of
+# the PROCESS. A `ui_qml` view backend is per-MOUNT, so closing an app left
+# every callback it had taken armed on a freed `this` — a crash, and a
+# compounding one, since the next mount added a second set.
+#
+# Both halves are pinned here because either alone is satisfiable by a wrapper
+# that still has the defect: a SubHandle return with no owner is a ticket for a
+# subscription nothing will ever end automatically, and an owner with a bool
+# return leaves the author no way to end one early.
+#
+# `m_api` is the owner because it is the mount's identity object — the thing the
+# host creates per mount and deletes at unmount. FORBID `}, m_bridge)` names the
+# obvious wrong answer: the bridge is process-lifetime and keyed by
+# (origin, target), so owning by it would mean owning by nothing.
+_qtgen_test(consumer_subscriptions_name_their_owner generate consumer plain_module.lidl
+            REQUIRE_TEXT "logos::SubHandle on(const QString& eventName, RawEventCallback callback)"
+                         "logos::SubHandle onMoved("
+                         "logos::SubHandle PlainModule::on(const QString& eventName"
+                         "}, m_api);"
+            FORBID_TEXT "bool on(const QString& eventName"
+                        "bool PlainModule::onMoved("
+                        "}, m_bridge)")
+
+# The origin-bound flavour has NO identity object, so it names no owner and its
+# subscriptions stay process-lifetime — which is correct, and is what a cdylib
+# module (whose wrapper this is) has always had. Asserted as an absence so the
+# ownership change above cannot leak a LogosAPI into the surface whose whole
+# premise is that it has none.
+_qtgen_test(origin_consumer_subscribes_without_an_owner generate consumer plain_module.lidl
+            EXTRA_ARGS --binding origin
+            REQUIRE_TEXT "logos::SubHandle PlainModule::onMoved("
+            FORBID_TEXT "m_api")
+
 # --- 4. two consumer wrappers COMPILE in one translation unit -----------------
 #
 # The tests above run the generator and read its text; none of them ever hands

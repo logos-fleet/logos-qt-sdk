@@ -235,3 +235,19 @@ copying the generator's output over it: the byte-comparison then passed, which
 is the assertion that nothing else moved. `ownerOf(qual)` was already in scope
 at every emission site (it names the wrapper in the decode diagnostics), so the
 qualification adds no plumbing and no state.
+
+Rebased once more for WHO OWNS A SUBSCRIPTION (logos-workspace#220). Both
+goldens moved, and for the first time in this list they moved DIFFERENTLY —
+which is the whole content of the change, so it is worth reading as a pair:
+
+| change | binding | why |
+|---|---|---|
+| `bool on(...)` / `bool onMoved(...)` → `logos::SubHandle ...`, header and .cpp, and the empty-callback early return becomes `return {}` | both | the Qt consumer surface had no way to name a subscription after taking it. `logos::SubHandle` is the ticket the Qt-free lp surface already returns from its generated `on<Event>()`; it converts to `bool` implicitly (deliberately non-`explicit`, see `logos_lp_client.h`), so every `if (dep.on(...))` and `bool ok = dep.on(...)` already written keeps compiling and keeps meaning what it did |
+| the two `logos::qt::subscribe(...)` calls gain a trailing `, m_api` | `plain_consumer` only | the OWNER of the subscription. A wrapper built from an identity object subscribes on its behalf, and nothing it took outlives it — which for a `ui_qml` view module is the MOUNT. Closing an app used to leave every callback it had taken armed on a freed `this`: SIGSEGV in `ChatBackend::applyDeliveryState` from lp's event trampoline, on the re-opened mount |
+| *(no owner argument)* | `plain_consumer_origin` only | this flavour holds no identity object by construction, so its subscriptions stay process-lifetime — which is correct for a cdylib module, and is what both flavours had before. `origin_consumer_subscribes_without_an_owner` in `CMakeLists.txt` states it as an absence |
+
+**Nothing else moved.** No method, no record codec, no async overload and no
+payload decode changed in either golden; `onSubscriptionStatus`,
+`subscriptionGeneration`, `setRestartPolicy` and `rearmSubscriptions` are
+untouched, because those are per-TARGET state and this is about per-OWNER
+lifetime.

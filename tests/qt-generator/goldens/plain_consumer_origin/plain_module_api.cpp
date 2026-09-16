@@ -98,10 +98,10 @@ PlainModule::PlainModule(const QString& origin)
     : m_moduleName(QStringLiteral("plain_module")),
       m_bridge(logos::qt::LpBridge::forOrigin(origin, QStringLiteral("plain_module"))) {}
 
-bool PlainModule::on(const QString& eventName, RawEventCallback callback) {
+logos::SubHandle PlainModule::on(const QString& eventName, RawEventCallback callback) {
     if (!callback) {
         qWarning() << "PlainModule: ignoring empty event callback for" << eventName;
-        return false;
+        return {};
     }
     const QString _name = eventName;
     return logos::qt::subscribe(m_bridge, eventName.toStdString(),
@@ -110,20 +110,20 @@ bool PlainModule::on(const QString& eventName, RawEventCallback callback) {
         });
 }
 
-bool PlainModule::on(const QString& eventName, EventCallback callback) {
+logos::SubHandle PlainModule::on(const QString& eventName, EventCallback callback) {
     if (!callback) {
         qWarning() << "PlainModule: ignoring empty event callback for" << eventName;
-        return false;
+        return {};
     }
     return on(eventName, [callback](const QString&, const QVariantList& data) {
         callback(data);
     });
 }
 
-bool PlainModule::onMoved(std::function<void(const Point& from, const Point& to)> callback) {
+logos::SubHandle PlainModule::onMoved(std::function<void(const Point& from, const Point& to)> callback) {
     if (!callback) {
         qWarning() << "PlainModule: ignoring empty event callback for" << QStringLiteral("moved");
-        return false;
+        return {};
     }
     return logos::qt::subscribe(m_bridge, "moved", [callback](nlohmann::json _a) {
         if (!_a.is_array() || _a.size() < 2) return;
