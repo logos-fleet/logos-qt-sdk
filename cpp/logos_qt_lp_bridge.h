@@ -22,6 +22,7 @@
 // ---------------------------------------------------------------------------
 
 #include <QByteArray>
+#include <QDebug>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -338,7 +339,16 @@ private:
                 std::lock_guard<std::mutex> lock(watchMutex());
                 watchedApis().erase(dead);
             }
-            LpBridge::dropAllOwnedBy(dead);
+            const std::size_t dropped = LpBridge::dropAllOwnedBy(dead);
+            // SAID OUT LOUD, once per identity that had any. The thing this
+            // guarantees is invisible by construction -- a callback that does
+            // not fire leaves no trace -- and the failure it replaces was a
+            // crash three mounts later with nothing in the log connecting it to
+            // a close. One line, and only when there was something to drop, so
+            // a module-lifetime consumer prints nothing ever.
+            if (dropped > 0)
+                qDebug() << "logos::qt: the identity that took" << dropped
+                         << "lp subscription(s) is gone; un-armed with it";
         });
     }
     static std::mutex& watchMutex()
