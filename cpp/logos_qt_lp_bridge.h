@@ -28,10 +28,12 @@
 #include <QVariant>
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -128,14 +130,85 @@ public:
         client().invokeAsyncResult(method, args, std::move(cb), timeoutMs);
     }
 
-    // Keep an lp subscription alive for the process, mirroring the Qt
-    // channel's "subscribe once, delivered forever" behaviour.
-    bool keep(logos::LpSubscription sub)
+    // Park an lp subscription here, under the identity that took it, and hand
+    // back a non-owning ticket for it.
+    //
+    // "Subscribe once, delivered forever" was the whole contract until
+    // logos-workspace#220, and for a MODULE it is still exactly right: a
+    // generated wrapper is a copyable handle, call sites subscribe on a
+    // `bind_x(...)` temporary, and a subscription whose lifetime was the
+    // temporary's would stop delivering the moment the expression ended.
+    //
+    // What that contract had no word for is a consumer that is not the process.
+    // A `ui_qml` view backend is per-MOUNT: the host builds a LogosAPI for the
+    // mount and deletes it at unmount, and the backend dies with it. Every
+    // subscription it took stayed armed on this vector holding a freed `this` --
+    // measured as a SIGSEGV at KERN_INVALID_ADDRESS 0x61 in
+    // ChatBackend::applyDeliveryState, delivered from lp's event trampoline
+    // while the RE-OPENED mount was still inside waitForSource. A QPointer in
+    // the callback turns that crash into a no-op; it un-arms nothing, so a
+    // second mount adds a second set and the first is never reclaimed.
+    //
+    // So a subscription now names its OWNER: the identity object it was taken
+    // on behalf of, or null for "the process", which is every module-lifetime
+    // caller and behaves precisely as before.
+    //
+    // A QObject rather than a LogosAPI, deliberately, and for the same reason
+    // m_api below is one: this member is emitted into EVERY translation unit
+    // that instantiates a bridge, including the origin-bound ones whose whole
+    // premise is that they name no Qt host identity type.
+    logos::SubHandle keep(logos::LpSubscription sub, const QObject* owner = nullptr)
     {
-        if (!sub.valid()) return false;
+        if (!sub.valid()) return {};
+        logos::SubHandle handle = sub.handle();
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_subs.push_back(std::move(sub));
-        return true;
+        m_subs.push_back(Owned{owner, std::move(sub)});
+        return handle;
+    }
+
+    // Hand back everything `owner` subscribed through THIS bridge, and say how
+    // many that was.
+    //
+    // A null owner is refused rather than matched: null is the spelling of "the
+    // process owns this", and nothing means to end the process's subscriptions.
+    std::size_t dropOwnedBy(const QObject* owner)
+    {
+        if (!owner) return 0;
+        // Moved out under the lock and destroyed OUTSIDE it. ~LpSubscription
+        // calls lp_unsubscribe, which blocks until an in-flight delivery for
+        // that subscription has returned; holding m_mutex across that wait would
+        // put it in front of every other subscribe through this bridge.
+        std::vector<logos::LpSubscription> doomed;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto it = m_subs.begin(); it != m_subs.end(); ) {
+                if (it->owner != owner) { ++it; continue; }
+                doomed.push_back(std::move(it->sub));
+                it = m_subs.erase(it);
+            }
+        }
+        return doomed.size();
+    }
+
+    // The same question asked of the whole process, which is the only way it
+    // can usefully be asked: one identity subscribes to several TARGETS, each
+    // of which is a different bridge, and it keeps no list of them.
+    static std::size_t dropAllOwnedBy(const QObject* owner)
+    {
+        if (!owner) return 0;
+        std::vector<LpBridge*> all;
+        {
+            Registry& reg = registry();
+            std::lock_guard<std::mutex> lock(reg.mutex);
+            all.reserve(reg.bridges.size());
+            for (const auto& entry : reg.bridges) all.push_back(entry.second.get());
+        }
+        // Outside the registry lock: a bridge's address is stable (entries are
+        // never erased), so the pointers stay good, and the unsubscribe wait
+        // above must not block every wrapper being constructed on another mount.
+        std::size_t dropped = 0;
+        for (LpBridge* bridge : all) dropped += bridge->dropOwnedBy(owner);
+        return dropped;
     }
 
     // The bridge for (this module, `target`), where "this module" is the one
@@ -152,6 +225,11 @@ public:
         // see. Anything without its own LogosAPI must state its origin.
         // `&syncFromApi` is taken HERE and nowhere else, and that placement is
         // load-bearing rather than tidy — see syncFromApi's own comment.
+        //
+        // Watching the object's lifetime is taken here for the same reason it
+        // is taken at all: this factory is the one that is handed a per-MOUNT
+        // identity. See watchApiLifetime.
+        watchApiLifetime(api);
         return lookup(api->moduleName().toStdString(), target.toStdString(), api,
                       &LpBridge::syncFromApi);
     }
@@ -204,18 +282,74 @@ private:
                             LogosAPI* api, SyncFn sync)
     {
         const std::string key = origin + "\x1f" + target;
-        static std::mutex s_mutex;
-        static std::map<std::string, std::unique_ptr<LpBridge>> s_bridges;
-        std::lock_guard<std::mutex> lock(s_mutex);
-        auto it = s_bridges.find(key);
-        if (it == s_bridges.end()) {
-            it = s_bridges.emplace(key, std::unique_ptr<LpBridge>(
-                                            new LpBridge(api, sync, target, origin)))
+        Registry& reg = registry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.bridges.find(key);
+        if (it == reg.bridges.end()) {
+            it = reg.bridges.emplace(key, std::unique_ptr<LpBridge>(
+                                              new LpBridge(api, sync, target, origin)))
                      .first;
         } else if (api) {
             it->second->adopt(api, sync);
         }
         return it->second.get();
+    }
+
+    // The process's bridges. Named rather than left as two statics inside
+    // lookup(), because dropAllOwnedBy has to walk the same map: a subscription
+    // is reachable only through the bridge that keeps it, and an identity that
+    // is going away names targets rather than bridges.
+    struct Registry {
+        std::mutex mutex;
+        std::map<std::string, std::unique_ptr<LpBridge>> bridges;
+    };
+    static Registry& registry()
+    {
+        static Registry reg;
+        return reg;
+    }
+
+    // Nothing a per-mount identity subscribed may outlive it.
+    //
+    // dropAllOwnedBy is the mechanism and a host CAN call it — the mobile
+    // Shell's view-mount teardown does, at the one instant that is exactly
+    // right, before the view's own objects are freed. This is the floor under
+    // that: the identity object announces its own death, and a subscription
+    // taken on its behalf never survives it whatever the caller remembered.
+    // Without it the invariant would be a convention, and every host and every
+    // generated plugin would have to keep it — which is what logos-workspace#220
+    // found four modules failing to do.
+    //
+    // Installed ONCE per object: forTarget runs for every wrapper a mount
+    // constructs. The address leaves the watched set from inside the handler,
+    // i.e. during ~QObject, so an object later allocated at the same address is
+    // watched afresh rather than mistaken for this one.
+    static void watchApiLifetime(QObject* api)
+    {
+        {
+            std::lock_guard<std::mutex> lock(watchMutex());
+            if (!watchedApis().insert(api).second) return;
+        }
+        // Context = the sender, so the connection dies with it; `destroyed` is
+        // emitted from ~QObject before Qt tears its connections down, so this
+        // still runs. Direct, on the thread doing the deleting.
+        QObject::connect(api, &QObject::destroyed, api, [](QObject* dead) {
+            {
+                std::lock_guard<std::mutex> lock(watchMutex());
+                watchedApis().erase(dead);
+            }
+            LpBridge::dropAllOwnedBy(dead);
+        });
+    }
+    static std::mutex& watchMutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+    static std::set<QObject*>& watchedApis()
+    {
+        static std::set<QObject*> s;
+        return s;
     }
 
     // Take `api` over from whatever this bridge was bound to before, and — the
@@ -310,7 +444,13 @@ private:
     std::string m_origin;
     logos::LpClient m_client;
     std::mutex m_mutex;   // guards m_subs only
-    std::vector<logos::LpSubscription> m_subs;
+    // One parked subscription and the identity it belongs to. Null owner = the
+    // process, which is what every module-lifetime consumer has always been.
+    struct Owned {
+        const QObject* owner;
+        logos::LpSubscription sub;
+    };
+    std::vector<Owned> m_subs;
 };
 
 // ── what a generated wrapper actually calls ─────────────────────────────────
@@ -368,12 +508,39 @@ inline void invokeAsyncResult(LpBridge* bridge,
     bridge->invokeAsyncResult(method, args, std::move(cb), timeoutMs);
 }
 
-inline bool subscribe(LpBridge* bridge,
-                      const std::string& event,
-                      std::function<void(nlohmann::json)> cb)
+// Subscribe on behalf of `owner`, and hand back a ticket for what was taken.
+//
+// The return used to be a bare bool, and a SubHandle converts to one
+// implicitly (logos_lp_client.h explains why that conversion is not explicit),
+// so every `if (dep.on(...))` and `bool ok = dep.on(...)` written against it
+// keeps compiling and keeps meaning what it did. What it adds is the thing the
+// Qt consumer surface did not have at all: a name for the subscription
+// afterwards, so an author can end one at a moment of their choosing.
+//
+// `owner` null means the process, which is the default and the old behaviour.
+// A generated wrapper that HAS an identity object passes it, and then nothing
+// it subscribed outlives that identity.
+inline logos::SubHandle subscribe(LpBridge* bridge,
+                                  const std::string& event,
+                                  std::function<void(nlohmann::json)> cb,
+                                  const QObject* owner = nullptr)
 {
-    if (!bridge) return false;
-    return bridge->keep(bridge->client().subscribe(event, std::move(cb)));
+    if (!bridge) return {};
+    return bridge->keep(bridge->client().subscribe(event, std::move(cb)), owner);
+}
+
+// End every subscription taken on behalf of `owner`, across every target, and
+// say how many that was.
+//
+// The call a host makes when it retires a per-mount identity, and the call a
+// view backend can make for itself from `aboutToUnload()`. Idempotent: a second
+// call finds nothing and answers 0. It happens on its own when the identity
+// object is destroyed (LpBridge::watchApiLifetime) — calling it explicitly is
+// how a caller chooses the INSTANT, which matters when the objects the
+// callbacks touch are freed before the identity is.
+inline std::size_t dropSubscriptions(const QObject* owner)
+{
+    return LpBridge::dropAllOwnedBy(owner);
 }
 
 // The target's subscription state, forwarded to the bridge's client.

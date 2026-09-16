@@ -668,12 +668,20 @@ QString lidlMakeQtConsumerHeader(const ModuleDecl& module,
 
     s << "    using RawEventCallback = std::function<void(const QString&, const QVariantList&)>;\n";
     s << "    using EventCallback = std::function<void(const QVariantList&)>;\n\n";
-    s << "    bool on(const QString& eventName, RawEventCallback callback);\n";
-    s << "    bool on(const QString& eventName, EventCallback callback);\n";
+    // A TICKET, where this returned a bare bool (logos-workspace#220). The
+    // subscription is still OWNED by the process-lifetime bridge -- an author
+    // cannot end one by dropping a return value, and the "subscribe once,
+    // delivered forever" contract a `bind_x(...)` temporary depends on is
+    // unchanged. What the ticket adds is that the subscription has a NAME
+    // afterwards, so ending it deliberately is reachable at all. It converts to
+    // bool implicitly, so every `if (dep.on(...))` already written keeps
+    // compiling and keeps meaning what it did.
+    s << "    logos::SubHandle on(const QString& eventName, RawEventCallback callback);\n";
+    s << "    logos::SubHandle on(const QString& eventName, EventCallback callback);\n";
 
     for (const EventDecl& ev : module.events) {
         if (ev.name.empty()) continue;
-        s << "    bool " << eventAccessor(ev.name)
+        s << "    logos::SubHandle " << eventAccessor(ev.name)
           << "(std::function<void(" << eventCbParams(module, ev)
           << ")> callback);\n";
     }
@@ -1090,24 +1098,35 @@ QString lidlMakeQtConsumerSource(const ModuleDecl& module,
           << moduleName << "\"))) {}\n\n";
     }
 
-    // Untyped subscription channel. Same signature, same "subscribe once,
-    // delivered for the module's lifetime" contract; the payload is decoded by
-    // the canonical args converter rather than by a table written here.
-    s << "bool " << className << "::on(const QString& eventName, RawEventCallback callback) {\n";
+    // Untyped subscription channel. The payload is decoded by the canonical
+    // args converter rather than by a table written here, and "subscribe once,
+    // delivered for the lifetime of whoever took it" is still the contract --
+    // what changed is that the lifetime can now be named.
+    //
+    // WHO OWNS WHAT IS SUBSCRIBED (logos-workspace#220). A wrapper that HAS an
+    // identity object names it as the owner, and then nothing it subscribed
+    // outlives that object -- which for a `ui_qml` view module is the MOUNT, so
+    // closing an app un-arms its callbacks instead of leaving them pointed at a
+    // freed backend. The origin-bound flavour has no such object and passes
+    // none, which is the process-lifetime default and the behaviour every
+    // module-lifetime consumer already had.
+    const QString ownerArg = noApi ? QString() : QStringLiteral(", m_api");
+
+    s << "logos::SubHandle " << className << "::on(const QString& eventName, RawEventCallback callback) {\n";
     s << "    if (!callback) {\n";
     s << "        qWarning() << \"" << className << ": ignoring empty event callback for\" << eventName;\n";
-    s << "        return false;\n";
+    s << "        return {};\n";
     s << "    }\n";
     s << "    const QString _name = eventName;\n";
     s << "    return logos::qt::subscribe(m_bridge, eventName.toStdString(),\n";
     s << "        [callback, _name](nlohmann::json _a) {\n";
     s << "            callback(_name, logos::nlohmannArgsToQVariantList(_a));\n";
-    s << "        });\n";
+    s << "        }" << ownerArg << ");\n";
     s << "}\n\n";
-    s << "bool " << className << "::on(const QString& eventName, EventCallback callback) {\n";
+    s << "logos::SubHandle " << className << "::on(const QString& eventName, EventCallback callback) {\n";
     s << "    if (!callback) {\n";
     s << "        qWarning() << \"" << className << ": ignoring empty event callback for\" << eventName;\n";
-    s << "        return false;\n";
+    s << "        return {};\n";
     s << "    }\n";
     s << "    return on(eventName, [callback](const QString&, const QVariantList& data) {\n";
     s << "        callback(data);\n";
@@ -1117,13 +1136,13 @@ QString lidlMakeQtConsumerSource(const ModuleDecl& module,
     // Typed event accessors.
     for (const EventDecl& ev : module.events) {
         if (ev.name.empty()) continue;
-        s << "bool " << className << "::" << eventAccessor(ev.name)
+        s << "logos::SubHandle " << className << "::" << eventAccessor(ev.name)
           << "(std::function<void(" << eventCbParams(module, ev)
           << ")> callback) {\n";
         s << "    if (!callback) {\n";
         s << "        qWarning() << \"" << className << ": ignoring empty event callback for\" "
           << "<< QStringLiteral(\"" << qs(ev.name) << "\");\n";
-        s << "        return false;\n";
+        s << "        return {};\n";
         s << "    }\n";
         s << "    return logos::qt::subscribe(m_bridge, \"" << qs(ev.name)
           << "\", [callback](nlohmann::json _a) {\n";
@@ -1144,7 +1163,7 @@ QString lidlMakeQtConsumerSource(const ModuleDecl& module,
             args << fromWire(module, ev.params[i].type, QString("_a.at(%1)").arg(i), qual);
         s << args.join(", ");
         s << ");\n";
-        s << "    });\n";
+        s << "    }" << ownerArg << ");\n";
         s << "}\n\n";
     }
 
