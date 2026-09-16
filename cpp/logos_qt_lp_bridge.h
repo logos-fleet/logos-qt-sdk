@@ -333,7 +333,16 @@ private:
         }
         // Context = the sender, so the connection dies with it; `destroyed` is
         // emitted from ~QObject before Qt tears its connections down, so this
-        // still runs. Direct, on the thread doing the deleting.
+        // still runs.
+        //
+        // DIRECT, and stated rather than left to Qt::AutoConnection. Auto
+        // compares the EMITTING thread with the context object's, and queues
+        // when they differ -- and a queued call to an object that is being
+        // destroyed is dropped, so the drop would silently never happen for an
+        // identity deleted from a thread other than its own. Everything below
+        // is thread-safe by construction (a mutex, then lp_unsubscribe, which
+        // the C ABI documents as safe from any thread), so running on the
+        // deleting thread is both correct and the only reliable choice.
         QObject::connect(api, &QObject::destroyed, api, [](QObject* dead) {
             {
                 std::lock_guard<std::mutex> lock(watchMutex());
@@ -349,7 +358,7 @@ private:
             if (dropped > 0)
                 qDebug() << "logos::qt: the identity that took" << dropped
                          << "lp subscription(s) is gone; un-armed with it";
-        });
+        }, Qt::DirectConnection);
     }
     static std::mutex& watchMutex()
     {
