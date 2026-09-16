@@ -310,6 +310,19 @@ private:
         return reg;
     }
 
+    // The identity objects whose destruction this class is already watching.
+    // Shaped like Registry above and for the same reason: a table and the mutex
+    // that guards it are one thing, and are never touched apart.
+    struct Watched {
+        std::mutex mutex;
+        std::set<QObject*> apis;
+    };
+    static Watched& watched()
+    {
+        static Watched w;
+        return w;
+    }
+
     // Nothing a per-mount identity subscribed may outlive it.
     //
     // dropAllOwnedBy is the mechanism and a host CAN call it — the mobile
@@ -328,8 +341,9 @@ private:
     static void watchApiLifetime(QObject* api)
     {
         {
-            std::lock_guard<std::mutex> lock(watchMutex());
-            if (!watchedApis().insert(api).second) return;
+            Watched& w = watched();
+            std::lock_guard<std::mutex> lock(w.mutex);
+            if (!w.apis.insert(api).second) return;
         }
         // Context = the sender, so the connection dies with it; `destroyed` is
         // emitted from ~QObject before Qt tears its connections down, so this
@@ -345,8 +359,9 @@ private:
         // deleting thread is both correct and the only reliable choice.
         QObject::connect(api, &QObject::destroyed, api, [](QObject* dead) {
             {
-                std::lock_guard<std::mutex> lock(watchMutex());
-                watchedApis().erase(dead);
+                Watched& w = watched();
+                std::lock_guard<std::mutex> lock(w.mutex);
+                w.apis.erase(dead);
             }
             const std::size_t dropped = LpBridge::dropAllOwnedBy(dead);
             // SAID OUT LOUD, once per identity that had any. The thing this
@@ -359,16 +374,6 @@ private:
                 qDebug() << "logos::qt: the identity that took" << dropped
                          << "lp subscription(s) is gone; un-armed with it";
         }, Qt::DirectConnection);
-    }
-    static std::mutex& watchMutex()
-    {
-        static std::mutex m;
-        return m;
-    }
-    static std::set<QObject*>& watchedApis()
-    {
-        static std::set<QObject*> s;
-        return s;
     }
 
     // Take `api` over from whatever this bridge was bound to before, and — the
@@ -569,9 +574,10 @@ inline std::size_t dropSubscriptions(const QObject* owner)
 // through it attaches to that target's single handle, and a provider that dies
 // takes all of them down together.
 //
-// keep() still parks each subscription handle for the process lifetime, exactly
-// as before — the Qt consumer never owned it and still does not. These give the
-// author the state that handle would otherwise have carried.
+// keep() still parks the OWNING handle — the Qt consumer never held it and
+// still does not, whoever the subscription's owner is. These give the author the
+// per-target state that handle would otherwise have carried; dropSubscriptions
+// above is the per-owner lifetime, and the two do not overlap.
 
 inline void onSubscriptionStatus(LpBridge* bridge,
                                  std::function<void(logos::SubStatus, std::uint64_t)> cb)
